@@ -7,6 +7,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+DEFAULT_NORMALIZE_LUFS = -16.0
+DEFAULT_NORMALIZE_LRA = 11.0
+DEFAULT_NORMALIZE_TRUE_PEAK = -1.5
+DEFAULT_VOCAL_EQ_HIGHPASS = 120.0
+DEFAULT_VOCAL_EQ_PRESENCE_FREQ = 2500.0
+DEFAULT_VOCAL_EQ_PRESENCE_Q = 1.2
+DEFAULT_VOCAL_EQ_PRESENCE_GAIN = 3.0
+DEFAULT_VOCAL_EQ_CLARITY_FREQ = 4500.0
+DEFAULT_VOCAL_EQ_CLARITY_Q = 1.0
+DEFAULT_VOCAL_EQ_CLARITY_GAIN = 2.0
+
 
 def get_duration(input_file):
     cmd = [
@@ -19,6 +30,18 @@ def get_duration(input_file):
     return float(result.stdout.strip())
 
 
+def get_audio_codec(input_file):
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(input_file),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
 def detect_silences(input_file, silence_db, silence_duration):
     """Return list of (start, end) silence intervals in seconds."""
     cmd = [
@@ -26,7 +49,7 @@ def detect_silences(input_file, silence_db, silence_duration):
         "-af", f"silencedetect=noise={silence_db}dB:d={silence_duration}",
         "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     silences = []
     silence_start = None
     for line in result.stderr.splitlines():
@@ -139,7 +162,34 @@ def fmt(seconds):
     return f"{m:02d}:{s:05.2f}"
 
 
-def split_and_encode(input_file, segments, output_dir, fmt_arg):
+def build_filter_chain(args):
+    filters = []
+    if args.vocal_eq:
+        filters.append(
+            "highpass=f={highpass},"
+            "equalizer=f={presence_freq}:t=q:w={presence_q}:g={presence_gain},"
+            "equalizer=f={clarity_freq}:t=q:w={clarity_q}:g={clarity_gain}".format(
+                highpass=args.vocal_eq_highpass,
+                presence_freq=args.vocal_eq_presence_freq,
+                presence_q=DEFAULT_VOCAL_EQ_PRESENCE_Q,
+                presence_gain=args.vocal_eq_presence_gain,
+                clarity_freq=args.vocal_eq_clarity_freq,
+                clarity_q=DEFAULT_VOCAL_EQ_CLARITY_Q,
+                clarity_gain=args.vocal_eq_clarity_gain,
+            )
+        )
+    if args.normalize:
+        filters.append(
+            "loudnorm=I={integrated}:LRA={lra}:TP={true_peak}".format(
+                integrated=args.normalize_lufs,
+                lra=args.normalize_lra,
+                true_peak=args.normalize_true_peak,
+            )
+        )
+    return ",".join(filters)
+
+
+def split_and_encode(input_file, segments, output_dir, fmt_arg, audio_filter=None, wav_codec="pcm_s16le"):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(input_file).stem
@@ -149,10 +199,8 @@ def split_and_encode(input_file, segments, output_dir, fmt_arg):
         duration = end - start
         base = output_dir / f"{stem}_{i:02d}"
 
-        wav_path = base.with_suffix(".wav")
-        mp3_path = base.with_suffix(".mp3")
-
-        if fmt_arg in ("wav", "both"):
+        if fmt_arg == "wav" and not audio_filter:
+            wav_path = base.with_suffix(".wav")
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start), "-i", str(input_file),
@@ -161,20 +209,39 @@ def split_and_encode(input_file, segments, output_dir, fmt_arg):
             ]
             subprocess.run(cmd, capture_output=True, check=True)
             created.append(wav_path)
+            continue
 
-        if fmt_arg == "mp3":
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start), "-i", str(input_file),
-                "-t", str(duration),
-                "-q:a", "0", str(mp3_path),
-            ]
-            subprocess.run(cmd, capture_output=True, check=True)
-            created.append(mp3_path)
-        elif fmt_arg == "both":
-            cmd = ["ffmpeg", "-y", "-i", str(wav_path), "-q:a", "0", str(mp3_path)]
-            subprocess.run(cmd, capture_output=True, check=True)
-            created.append(mp3_path)
+        outputs = []
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-i", str(input_file),
+            "-t", str(duration),
+        ]
+
+        if audio_filter:
+            cmd.extend(["-af", audio_filter])
+
+        if fmt_arg in ("wav", "both"):
+            wav_path = base.with_suffix(".wav")
+            cmd.extend([
+                "-map", "0:a:0",
+                "-c:a", wav_codec,
+                str(wav_path),
+            ])
+            outputs.append(wav_path)
+
+        if fmt_arg in ("mp3", "both"):
+            mp3_path = base.with_suffix(".mp3")
+            cmd.extend([
+                "-map", "0:a:0",
+                "-c:a", "libmp3lame",
+                "-q:a", "0",
+                str(mp3_path),
+            ])
+            outputs.append(mp3_path)
+
+        subprocess.run(cmd, capture_output=True, check=True)
+        created.extend(outputs)
 
     return created
 
@@ -201,6 +268,26 @@ def main():
                              "Can be repeated.")
     parser.add_argument("--format", choices=["wav", "mp3", "both"], default="mp3",
                         help="Output format (default: mp3)")
+    parser.add_argument("--normalize", action="store_true",
+                        help="Apply one-pass loudness normalization before encoding")
+    parser.add_argument("--normalize-lufs", type=float, default=DEFAULT_NORMALIZE_LUFS,
+                        help=f"Integrated loudness target for --normalize (default: {DEFAULT_NORMALIZE_LUFS})")
+    parser.add_argument("--normalize-lra", type=float, default=DEFAULT_NORMALIZE_LRA,
+                        help=f"Loudness range target for --normalize (default: {DEFAULT_NORMALIZE_LRA})")
+    parser.add_argument("--normalize-true-peak", type=float, default=DEFAULT_NORMALIZE_TRUE_PEAK,
+                        help=f"True peak ceiling for --normalize in dBTP (default: {DEFAULT_NORMALIZE_TRUE_PEAK})")
+    parser.add_argument("--vocal-eq", action="store_true",
+                        help="Apply a mild EQ curve to bring vocals forward before encoding")
+    parser.add_argument("--vocal-eq-highpass", type=float, default=DEFAULT_VOCAL_EQ_HIGHPASS,
+                        help=f"High-pass cutoff for --vocal-eq in Hz (default: {DEFAULT_VOCAL_EQ_HIGHPASS})")
+    parser.add_argument("--vocal-eq-presence-freq", type=float, default=DEFAULT_VOCAL_EQ_PRESENCE_FREQ,
+                        help=f"Presence boost center for --vocal-eq in Hz (default: {DEFAULT_VOCAL_EQ_PRESENCE_FREQ})")
+    parser.add_argument("--vocal-eq-presence-gain", type=float, default=DEFAULT_VOCAL_EQ_PRESENCE_GAIN,
+                        help=f"Presence boost gain for --vocal-eq in dB (default: {DEFAULT_VOCAL_EQ_PRESENCE_GAIN})")
+    parser.add_argument("--vocal-eq-clarity-freq", type=float, default=DEFAULT_VOCAL_EQ_CLARITY_FREQ,
+                        help=f"Clarity boost center for --vocal-eq in Hz (default: {DEFAULT_VOCAL_EQ_CLARITY_FREQ})")
+    parser.add_argument("--vocal-eq-clarity-gain", type=float, default=DEFAULT_VOCAL_EQ_CLARITY_GAIN,
+                        help=f"Clarity boost gain for --vocal-eq in dB (default: {DEFAULT_VOCAL_EQ_CLARITY_GAIN})")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
 
@@ -211,10 +298,26 @@ def main():
 
     print(f"Analyzing {input_file.name} ...")
     total_duration = get_duration(input_file)
+    wav_codec = get_audio_codec(input_file)
     print(f"  Total duration : {fmt(total_duration)}")
 
+    out_of_range = [t for t in args.split_at if t <= 0 or t >= total_duration]
+    if out_of_range:
+        labels = ", ".join(fmt(t) for t in sorted(out_of_range))
+        print(
+            f"error: split points must be inside the file duration ({fmt(total_duration)}): {labels}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(f"  Detecting silences (>{args.silence_duration}s below {args.silence_db}dB) ...")
-    silences = detect_silences(input_file, args.silence_db, args.silence_duration)
+    try:
+        silences = detect_silences(input_file, args.silence_db, args.silence_duration)
+    except subprocess.CalledProcessError as exc:
+        print("error: ffmpeg silence detection failed", file=sys.stderr)
+        if exc.stderr:
+            print(exc.stderr.strip(), file=sys.stderr)
+        sys.exit(exc.returncode or 1)
     print(f"  Found {len(silences)} silence gap(s)")
 
     if args.split_at:
@@ -228,6 +331,20 @@ def main():
     merged = before - len(segments)
     if merged:
         print(f"  Merged {merged} short segment(s) below {args.min_segment}s into adjacent tracks")
+
+    audio_filter = build_filter_chain(args)
+    if args.vocal_eq:
+        print(
+            "  Applying vocal EQ during export "
+            f"(HPF {args.vocal_eq_highpass:g}Hz, +{args.vocal_eq_presence_gain:g}dB @ "
+            f"{args.vocal_eq_presence_freq:g}Hz, +{args.vocal_eq_clarity_gain:g}dB @ "
+            f"{args.vocal_eq_clarity_freq:g}Hz)"
+        )
+    if args.normalize:
+        print(
+            "  Applying one-pass loudness normalization during export "
+            f"(I={args.normalize_lufs:g}, LRA={args.normalize_lra:g}, TP={args.normalize_true_peak:g})"
+        )
 
     print(f"\nProposed splits — {len(segments)} track(s):\n")
     print(f"  {'#':>3}  {'Start':>8}  {'End':>8}  {'Duration':>8}")
@@ -246,7 +363,9 @@ def main():
             sys.exit(0)
 
     print(f"\nWriting to {args.output_dir}/ ...")
-    created = split_and_encode(input_file, segments, args.output_dir, args.format)
+    if not wav_codec.startswith("pcm_"):
+        wav_codec = "pcm_s16le"
+    created = split_and_encode(input_file, segments, args.output_dir, args.format, audio_filter, wav_codec)
     print(f"Done — {len(created)} file(s) created.")
     for f in created:
         print(f"  {f}")
