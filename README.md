@@ -23,6 +23,7 @@ The script shows a proposed split table and asks for confirmation before writing
 | `--silence-db` | `-40` | Noise floor threshold in dB |
 | `--silence-duration` | `7.0` | Minimum silence length (seconds) to treat as a song boundary |
 | `--min-segment` | `120.0` | Segments shorter than this (seconds) are merged into the next track — helps discard false starts |
+| `--drop-leading-quiet-db` | — | Drop leading merged segments whose mean volume stays below this dBFS threshold — useful for long dead-air/setup intros before practice really starts |
 | `--split-at TIME` | — | Force a split at a specific timestamp (`MM:SS`, `HH:MM:SS`, or seconds). Can be repeated. |
 | `--format` | `mp3` | Output format: `wav`, `mp3`, or `both` |
 | `--normalize` | — | Apply one-pass loudness normalization during export |
@@ -57,6 +58,11 @@ python3 split_recording.py rehearsal.wav --split-at 21:39 --split-at 1:02:15 --f
 Add normalization and a light vocal-presence EQ in the same ffmpeg pass:
 ```
 python3 split_recording.py rehearsal.wav --normalize --vocal-eq
+
+Typical practice with dead air at the start:
+```
+python3 split_recording.py rehearsal.wav --silence-db -22 --silence-duration 15 --min-segment 360 --drop-leading-quiet-db -31
+```
 ```
 
 Push vocals a bit harder and aim for a slightly louder result:
@@ -69,6 +75,7 @@ python3 split_recording.py rehearsal.wav --normalize --normalize-lufs -14 --voca
 - **Too many splits** (catching pauses within songs): raise `--silence-duration` or lower `--silence-db` (e.g. `-35`)
 - **Too few splits** (missing boundaries): lower `--silence-duration` or raise `--silence-db`
 - **Short false starts still showing up**: raise `--min-segment`
+- **Long dead-air/setup intro still being kept**: try `--drop-leading-quiet-db` around `-31` to `-33`
 - **Transition with no silence** (band went straight into talking): use `--split-at` with the known timestamp
 - `--normalize` uses ffmpeg's one-pass `loudnorm`; `--normalize-lufs`, `--normalize-lra`, and `--normalize-true-peak` let you tune the target
 - `--vocal-eq` adds a high-pass filter plus gentle presence boosts; the `--vocal-eq-*` flags let you tune the cutoff, boost centers, and gains

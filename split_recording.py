@@ -65,6 +65,27 @@ def detect_silences(input_file, silence_db, silence_duration):
     return silences
 
 
+def get_mean_volume(input_file, start, end):
+    """Return mean volume in dBFS for a segment, or None if ffmpeg doesn't report it."""
+    duration = end - start
+    if duration <= 0:
+        return None
+
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-ss", str(start), "-i", str(input_file),
+        "-t", str(duration),
+        "-af", "volumedetect",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    for line in result.stderr.splitlines():
+        m = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", line)
+        if m:
+            return float(m.group(1))
+    return None
+
+
 def parse_timestamp(ts):
     """Parse HH:MM:SS, MM:SS, or bare seconds into a float."""
     ts = ts.strip()
@@ -151,6 +172,20 @@ def merge_short_segments(segments, min_duration, pinned):
             i += 1
         segments = result
     return segments
+
+
+def drop_leading_quiet_segments(input_file, segments, threshold_db):
+    """Drop leading segments whose mean volume stays below threshold_db."""
+    kept = list(segments)
+    dropped = []
+    while kept:
+        start, end = kept[0]
+        mean_volume = get_mean_volume(input_file, start, end)
+        if mean_volume is None or mean_volume >= threshold_db:
+            break
+        dropped.append((start, end, mean_volume))
+        kept.pop(0)
+    return kept, dropped
 
 
 def fmt(seconds):
@@ -262,6 +297,9 @@ def main():
     parser.add_argument("--min-segment", type=float, default=120.0,
                         help="Minimum segment duration in seconds; shorter segments are merged "
                              "(default: 120.0)")
+    parser.add_argument("--drop-leading-quiet-db", type=float,
+                        help="Drop leading merged segments whose mean volume stays below this dBFS "
+                             "threshold (useful for dead air / setup noise before a practice)")
     parser.add_argument("--split-at", metavar="TIME", type=parse_timestamp, action="append",
                         default=[],
                         help="Force a split at this timestamp (HH:MM:SS, MM:SS, or seconds). "
@@ -331,6 +369,20 @@ def main():
     merged = before - len(segments)
     if merged:
         print(f"  Merged {merged} short segment(s) below {args.min_segment}s into adjacent tracks")
+
+    if args.drop_leading_quiet_db is not None:
+        try:
+            segments, dropped = drop_leading_quiet_segments(input_file, segments, args.drop_leading_quiet_db)
+        except subprocess.CalledProcessError as exc:
+            print("error: ffmpeg volume analysis failed", file=sys.stderr)
+            if exc.stderr:
+                print(exc.stderr.strip(), file=sys.stderr)
+            sys.exit(exc.returncode or 1)
+        for start, end, mean_volume in dropped:
+            print(
+                "  Dropped leading quiet segment "
+                f"{fmt(start)}-{fmt(end)} (mean {mean_volume:.1f} dBFS < {args.drop_leading_quiet_db:g} dBFS)"
+            )
 
     audio_filter = build_filter_chain(args)
     if args.vocal_eq:
