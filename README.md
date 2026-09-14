@@ -39,6 +39,7 @@ The script shows a proposed split table and asks for confirmation before writing
 | `--pad-end` | `0` | Seconds of tail kept after each segment, for ring-outs and decay |
 | `--split-at TIME` | — | Force a split at a specific timestamp (`MM:SS`, `HH:MM:SS`, or seconds). Can be repeated. |
 | `--format` | `mp3` | Output format: `wav`, `mp3`, or `both` |
+| `--mp3-quality` | `standard` | MP3 VBR preset: `high` (~245 kbps), `standard` (~190 kbps), `compact` (~165 kbps) |
 | `--normalize` | — | Apply one-pass loudness normalization during export |
 | `--normalize-lufs` | `-16.0` | Integrated loudness target for `--normalize` |
 | `--normalize-lra` | `11.0` | Loudness range target for `--normalize` |
@@ -96,6 +97,7 @@ python3 split_recording.py rehearsal.wav --normalize --normalize-lufs -14 --voca
 - **Short false starts still showing up**: raise `--min-segment`
 - **Long dead-air/setup intro still being kept**: try `--drop-leading-quiet-db` around `-31` to `-33`
 - **Transition with no silence** (band went straight into talking): use `--split-at` with the known timestamp
+- `--mp3-quality standard` (LAME V2) is transparent for most listening; use `high` (V0) to archive, `compact` (V4) to hand round on phones. `--format both` writes the WAV and the MP3 from a single decode pass
 - `--normalize` uses ffmpeg's one-pass `loudnorm`; `--normalize-lufs`, `--normalize-lra`, and `--normalize-true-peak` let you tune the target
 - `--vocal-eq` adds a high-pass filter plus gentle presence boosts; the `--vocal-eq-*` flags let you tune the cutoff, boost centers, and gains
 - A brief pause (5+ seconds of quiet) between songs makes auto-detection much more reliable

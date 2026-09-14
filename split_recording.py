@@ -7,6 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# LAME VBR quality levels. Lower number = higher bitrate.
+MP3_QUALITY_PRESETS = {
+    "high": 0,      # ~245 kbps VBR — archival
+    "standard": 2,  # ~190 kbps VBR — transparent for most listening
+    "compact": 4,   # ~165 kbps VBR — smaller files for phones and sharing
+}
+DEFAULT_MP3_QUALITY = "standard"
+
 DEFAULT_NORMALIZE_LUFS = -16.0
 DEFAULT_NORMALIZE_LRA = 11.0
 DEFAULT_NORMALIZE_TRUE_PEAK = -1.5
@@ -355,7 +363,8 @@ def build_filter_chain(args):
     return ",".join(filters)
 
 
-def split_and_encode(input_file, segments, output_dir, fmt_arg, audio_filter=None, wav_codec="pcm_s16le"):
+def split_and_encode(input_file, segments, output_dir, fmt_arg, audio_filter=None, wav_codec="pcm_s16le",
+                     mp3_quality=MP3_QUALITY_PRESETS[DEFAULT_MP3_QUALITY]):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(input_file).stem
@@ -401,7 +410,7 @@ def split_and_encode(input_file, segments, output_dir, fmt_arg, audio_filter=Non
             cmd.extend([
                 "-map", "0:a:0",
                 "-c:a", "libmp3lame",
-                "-q:a", "0",
+                "-q:a", str(mp3_quality),
                 str(mp3_path),
             ])
             outputs.append(mp3_path)
@@ -461,6 +470,9 @@ def main():
                              "Can be repeated.")
     parser.add_argument("--format", choices=["wav", "mp3", "both"], default="mp3",
                         help="Output format (default: mp3)")
+    parser.add_argument("--mp3-quality", choices=sorted(MP3_QUALITY_PRESETS), default=DEFAULT_MP3_QUALITY,
+                        help="MP3 VBR quality preset: high (~245 kbps), standard (~190 kbps), "
+                             f"compact (~165 kbps) (default: {DEFAULT_MP3_QUALITY})")
     parser.add_argument("--normalize", action="store_true",
                         help="Apply one-pass loudness normalization before encoding")
     parser.add_argument("--normalize-lufs", type=float, default=DEFAULT_NORMALIZE_LUFS,
@@ -570,6 +582,9 @@ def main():
 
     segments = pad_segments(segments, args.pad_start, args.pad_end, total_duration)
 
+    if args.format in ("mp3", "both"):
+        print(f"  Encoding MP3 at {args.mp3_quality} quality (LAME V{MP3_QUALITY_PRESETS[args.mp3_quality]})")
+
     audio_filter = build_filter_chain(args)
     if args.vocal_eq:
         print(
@@ -603,7 +618,9 @@ def main():
     print(f"\nWriting to {args.output_dir}/ ...")
     if not wav_codec.startswith("pcm_"):
         wav_codec = "pcm_s16le"
-    created = split_and_encode(input_file, segments, args.output_dir, args.format, audio_filter, wav_codec)
+    mp3_quality = MP3_QUALITY_PRESETS[args.mp3_quality]
+    created = split_and_encode(input_file, segments, args.output_dir, args.format, audio_filter,
+                               wav_codec, mp3_quality)
     print(f"Done — {len(created)} file(s) created.")
     for f in created:
         print(f"  {f}")
