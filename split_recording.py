@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Split a long WAV recording into songs based on silence detection."""
+"""Split a long WAV recording into songs by detecting the gaps between them."""
 
 import argparse
 import re
@@ -63,6 +63,85 @@ def detect_silences(input_file, silence_db, silence_duration):
                 silences.append((silence_start, float(m.group(1))))
                 silence_start = None
     return silences
+
+
+def get_sample_rate(input_file):
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(input_file),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return int(result.stdout.strip())
+
+
+def measure_envelope(input_file, window):
+    """Return [(time, rms_dbfs)] sampled every `window` seconds."""
+    sample_rate = get_sample_rate(input_file)
+    frame = max(1, int(round(window * sample_rate)))
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats", "-i", str(input_file),
+        "-af",
+        f"asetnsamples=n={frame},astats=metadata=1:reset=1,"
+        "ametadata=print:key=lavfi.astats.Overall.RMS_level",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    envelope = []
+    timestamp = None
+    for line in result.stderr.splitlines():
+        m = re.search(r"pts_time:([\d.]+)", line)
+        if m:
+            timestamp = float(m.group(1))
+            continue
+        m = re.search(r"RMS_level=(-?[\d.]+|-?inf)", line)
+        if m and timestamp is not None:
+            value = m.group(1)
+            envelope.append((timestamp, -99.0 if "inf" in value else float(value)))
+            timestamp = None
+    return envelope
+
+
+def detect_quiet_regions(input_file, threshold_db, bridge, min_gap, window=0.5):
+    """Return (start, end) quiet regions found in the RMS envelope.
+
+    Unlike raw silencedetect, a brief transient — a stick click, a cough, one
+    clap — does not break a gap in two: a loud stretch shorter than `bridge`
+    seconds is absorbed into the surrounding quiet. Live recordings are full of
+    those, and they are what makes plain silence detection miss real boundaries.
+    """
+    envelope = measure_envelope(input_file, window)
+    if not envelope:
+        return []
+
+    quiet = [db < threshold_db for _, db in envelope]
+    total = len(quiet)
+    regions = []
+    i = 0
+    while i < total:
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < total:
+            if quiet[j]:
+                j += 1
+                continue
+            k = j
+            while k < total and not quiet[k]:
+                k += 1
+            if k < total and (k - j) * window <= bridge:
+                j = k  # short blip inside the gap — keep going
+            else:
+                break
+        start = envelope[i][0]
+        end = envelope[j][0] if j < total else envelope[-1][0] + window
+        if end - start >= min_gap:
+            regions.append((start, end))
+        i = max(j, i + 1)
+    return regions
 
 
 def get_mean_volume(input_file, start, end):
@@ -188,6 +267,58 @@ def drop_leading_quiet_segments(input_file, segments, threshold_db):
     return kept, dropped
 
 
+def drop_short_segments(segments, min_duration, pinned):
+    """Drop segments shorter than min_duration instead of merging them.
+
+    The counterpart to merge_short_segments, for envelope detection: what sits
+    between songs in a live set is banter and tuning, not part of the next
+    track. Segments on a forced split boundary are always kept.
+    """
+    kept = []
+    dropped = []
+    for start, end in segments:
+        if end - start < min_duration and start not in pinned and end not in pinned:
+            dropped.append((start, end))
+        else:
+            kept.append((start, end))
+    return kept, dropped
+
+
+def drop_quiet_segments(input_file, segments, threshold_db):
+    """Drop every segment whose mean volume stays below threshold_db.
+
+    Catches talk that ran long enough to survive the length filter: a band
+    playing sits far above the room talking between songs.
+    """
+    kept = []
+    dropped = []
+    for start, end in segments:
+        mean_volume = get_mean_volume(input_file, start, end)
+        if mean_volume is not None and mean_volume < threshold_db:
+            dropped.append((start, end, mean_volume))
+        else:
+            kept.append((start, end))
+    return kept, dropped
+
+
+def pad_segments(segments, pad_start, pad_end, total_duration):
+    """Widen each segment into the surrounding quiet so the first note and the
+    final ring-out survive. Never crosses the midpoint of the gap to a
+    neighbour, so padded segments cannot overlap."""
+    if not (pad_start or pad_end):
+        return segments
+    padded = []
+    for i, (start, end) in enumerate(segments):
+        new_start = max(0.0, start - pad_start)
+        new_end = min(total_duration, end + pad_end)
+        if i > 0:
+            new_start = max(new_start, (segments[i - 1][1] + start) / 2)
+        if i + 1 < len(segments):
+            new_end = min(new_end, (end + segments[i + 1][0]) / 2)
+        padded.append((new_start, new_end))
+    return padded
+
+
 def fmt(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -290,6 +421,19 @@ def main():
     parser.add_argument("input", help="Input WAV file")
     parser.add_argument("-o", "--output-dir", default="output",
                         help="Output directory (default: output)")
+    parser.add_argument("--detect", choices=["silence", "envelope"], default="silence",
+                        help="Boundary detection method. 'silence' uses ffmpeg silencedetect; "
+                             "'envelope' uses an RMS envelope that ignores brief transients "
+                             "(recommended for live recordings with an audience)")
+    parser.add_argument("--envelope-db", type=float, default=-38,
+                        help="RMS threshold in dB below which a window counts as quiet, for "
+                             "--detect envelope (default: -38)")
+    parser.add_argument("--envelope-bridge", type=float, default=2.0,
+                        help="Loud blips shorter than this many seconds do not break a gap, for "
+                             "--detect envelope (default: 2.0)")
+    parser.add_argument("--envelope-min-gap", type=float, default=5.0,
+                        help="Minimum sustained quiet in seconds to count as a boundary, for "
+                             "--detect envelope (default: 5.0)")
     parser.add_argument("--silence-db", type=float, default=-40,
                         help="Silence threshold in dB (default: -40)")
     parser.add_argument("--silence-duration", type=float, default=7.0,
@@ -297,6 +441,17 @@ def main():
     parser.add_argument("--min-segment", type=float, default=120.0,
                         help="Minimum segment duration in seconds; shorter segments are merged "
                              "(default: 120.0)")
+    parser.add_argument("--drop-short", action="store_true",
+                        help="Drop segments shorter than --min-segment instead of merging them "
+                             "into a neighbour (discards between-song banter and tuning)")
+    parser.add_argument("--pad-start", type=float, default=0.0,
+                        help="Seconds of lead-in to keep before each segment (default: 0)")
+    parser.add_argument("--pad-end", type=float, default=0.0,
+                        help="Seconds of tail to keep after each segment, for ring-outs "
+                             "(default: 0)")
+    parser.add_argument("--drop-quiet-db", type=float,
+                        help="Drop any segment whose mean volume stays below this dBFS threshold "
+                             "(not just leading ones) — catches long stretches of talk")
     parser.add_argument("--drop-leading-quiet-db", type=float,
                         help="Drop leading merged segments whose mean volume stays below this dBFS "
                              "threshold (useful for dead air / setup noise before a practice)")
@@ -348,15 +503,24 @@ def main():
         )
         sys.exit(1)
 
-    print(f"  Detecting silences (>{args.silence_duration}s below {args.silence_db}dB) ...")
+    if args.detect == "envelope":
+        print(f"  Detecting gaps from RMS envelope (>{args.envelope_min_gap}s below "
+              f"{args.envelope_db}dB, bridging blips up to {args.envelope_bridge}s) ...")
+    else:
+        print(f"  Detecting silences (>{args.silence_duration}s below {args.silence_db}dB) ...")
     try:
-        silences = detect_silences(input_file, args.silence_db, args.silence_duration)
+        if args.detect == "envelope":
+            silences = detect_quiet_regions(
+                input_file, args.envelope_db, args.envelope_bridge, args.envelope_min_gap
+            )
+        else:
+            silences = detect_silences(input_file, args.silence_db, args.silence_duration)
     except subprocess.CalledProcessError as exc:
-        print("error: ffmpeg silence detection failed", file=sys.stderr)
+        print("error: ffmpeg gap detection failed", file=sys.stderr)
         if exc.stderr:
             print(exc.stderr.strip(), file=sys.stderr)
         sys.exit(exc.returncode or 1)
-    print(f"  Found {len(silences)} silence gap(s)")
+    print(f"  Found {len(silences)} gap(s)")
 
     if args.split_at:
         labels = ", ".join(fmt(t) for t in sorted(args.split_at))
@@ -364,11 +528,17 @@ def main():
 
     pinned = set(args.split_at)
     segments = silences_to_segments(silences, total_duration, args.split_at)
-    before = len(segments)
-    segments = merge_short_segments(segments, args.min_segment, pinned)
-    merged = before - len(segments)
-    if merged:
-        print(f"  Merged {merged} short segment(s) below {args.min_segment}s into adjacent tracks")
+    if args.drop_short:
+        segments, dropped_short = drop_short_segments(segments, args.min_segment, pinned)
+        for start, end in dropped_short:
+            print(f"  Dropped short segment {fmt(start)}-{fmt(end)} "
+                  f"({fmt(end - start)} < {args.min_segment:g}s)")
+    else:
+        before = len(segments)
+        segments = merge_short_segments(segments, args.min_segment, pinned)
+        merged = before - len(segments)
+        if merged:
+            print(f"  Merged {merged} short segment(s) below {args.min_segment}s into adjacent tracks")
 
     if args.drop_leading_quiet_db is not None:
         try:
@@ -383,6 +553,22 @@ def main():
                 "  Dropped leading quiet segment "
                 f"{fmt(start)}-{fmt(end)} (mean {mean_volume:.1f} dBFS < {args.drop_leading_quiet_db:g} dBFS)"
             )
+
+    if args.drop_quiet_db is not None:
+        try:
+            segments, dropped = drop_quiet_segments(input_file, segments, args.drop_quiet_db)
+        except subprocess.CalledProcessError as exc:
+            print("error: ffmpeg volume analysis failed", file=sys.stderr)
+            if exc.stderr:
+                print(exc.stderr.strip(), file=sys.stderr)
+            sys.exit(exc.returncode or 1)
+        for start, end, mean_volume in dropped:
+            print(
+                "  Dropped quiet segment "
+                f"{fmt(start)}-{fmt(end)} (mean {mean_volume:.1f} dBFS < {args.drop_quiet_db:g} dBFS)"
+            )
+
+    segments = pad_segments(segments, args.pad_start, args.pad_end, total_duration)
 
     audio_filter = build_filter_chain(args)
     if args.vocal_eq:

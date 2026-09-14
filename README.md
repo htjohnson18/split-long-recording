@@ -1,6 +1,11 @@
 # split-long-recording
 
-Splits a long WAV recording (e.g. a band rehearsal) into individual songs using silence detection. Outputs MP3s by default.
+Splits a long WAV recording (e.g. a band rehearsal or a live set) into individual songs by detecting the gaps between them. Outputs MP3s by default.
+
+Two detection methods are available:
+
+- `--detect silence` (default) — ffmpeg's `silencedetect`. Fine for a quiet rehearsal room.
+- `--detect envelope` — measures an RMS envelope and tolerates brief transients. **Use this for live recordings.** A single stick click or cough in an otherwise silent gap splits that gap in two as far as `silencedetect` is concerned, and neither half is then long enough to count as a boundary — so real song breaks get missed no matter how you tune `--silence-duration`. The envelope method bridges those blips.
 
 ## Requirements
 
@@ -20,10 +25,18 @@ The script shows a proposed split table and asks for confirmation before writing
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-o`, `--output-dir` | `output` | Directory to write output files |
+| `--detect` | `silence` | Boundary detection: `silence` or `envelope` |
+| `--envelope-db` | `-38` | RMS level below which a window counts as quiet (`--detect envelope`) |
+| `--envelope-bridge` | `2.0` | Loud blips shorter than this (seconds) don't break a gap (`--detect envelope`) |
+| `--envelope-min-gap` | `5.0` | Minimum sustained quiet (seconds) to count as a boundary (`--detect envelope`) |
 | `--silence-db` | `-40` | Noise floor threshold in dB |
 | `--silence-duration` | `7.0` | Minimum silence length (seconds) to treat as a song boundary |
 | `--min-segment` | `120.0` | Segments shorter than this (seconds) are merged into the next track — helps discard false starts |
+| `--drop-short` | — | Drop segments shorter than `--min-segment` instead of merging them into a neighbour — discards between-song banter and tuning |
+| `--drop-quiet-db` | — | Drop *any* segment whose mean volume stays below this dBFS threshold — catches talk that ran long enough to survive the length filter |
 | `--drop-leading-quiet-db` | — | Drop leading merged segments whose mean volume stays below this dBFS threshold — useful for long dead-air/setup intros before practice really starts |
+| `--pad-start` | `0` | Seconds of lead-in kept before each segment, so onsets aren't clipped |
+| `--pad-end` | `0` | Seconds of tail kept after each segment, for ring-outs and decay |
 | `--split-at TIME` | — | Force a split at a specific timestamp (`MM:SS`, `HH:MM:SS`, or seconds). Can be repeated. |
 | `--format` | `mp3` | Output format: `wav`, `mp3`, or `both` |
 | `--normalize` | — | Apply one-pass loudness normalization during export |
@@ -59,6 +72,12 @@ Add normalization and a light vocal-presence EQ in the same ffmpeg pass:
 ```
 python3 split_recording.py rehearsal.wav --normalize --vocal-eq
 
+Live set with an audience — envelope detection, banter discarded, padded so nothing is clipped, normalized to a consistent level:
+```
+python3 split_recording.py liveset.wav --detect envelope --min-segment 60 --drop-short \
+    --drop-quiet-db -32 --pad-start 1 --pad-end 2 --format wav --normalize
+```
+
 Typical practice with dead air at the start:
 ```
 python3 split_recording.py rehearsal.wav --silence-db -22 --silence-duration 15 --min-segment 360 --drop-leading-quiet-db -31
@@ -80,3 +99,7 @@ python3 split_recording.py rehearsal.wav --normalize --normalize-lufs -14 --voca
 - `--normalize` uses ffmpeg's one-pass `loudnorm`; `--normalize-lufs`, `--normalize-lra`, and `--normalize-true-peak` let you tune the target
 - `--vocal-eq` adds a high-pass filter plus gentle presence boosts; the `--vocal-eq-*` flags let you tune the cutoff, boost centers, and gains
 - A brief pause (5+ seconds of quiet) between songs makes auto-detection much more reliable
+- **Live recording, boundaries missed at every setting**: switch to `--detect envelope`. Applause, stray clicks and chatter defeat `silencedetect`'s all-or-nothing threshold
+- **Banter showing up as its own track**: add `--drop-short` (songs are minutes long, banter is seconds) and set `--min-segment` between the two — check the proposed table before confirming
+- **Banter merged onto the front of a song**: that's `--min-segment` merging rather than dropping; `--drop-short` changes that
+- With `--drop-short`, `--min-segment` must sit *below* your shortest real song or that song gets discarded — the confirmation table shows exactly what would be dropped
