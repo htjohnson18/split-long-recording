@@ -105,3 +105,15 @@ python3 split_recording.py rehearsal.wav --normalize --normalize-lufs -14 --voca
 - **Banter showing up as its own track**: add `--drop-short` (songs are minutes long, banter is seconds) and set `--min-segment` between the two — check the proposed table before confirming
 - **Banter merged onto the front of a song**: that's `--min-segment` merging rather than dropping; `--drop-short` changes that
 - With `--drop-short`, `--min-segment` must sit *below* your shortest real song or that song gets discarded — the confirmation table shows exactly what would be dropped
+
+## Tests
+
+```
+python3 -m unittest -v
+```
+
+Stdlib `unittest`, no dependencies. The envelope, bridging, padding and
+drop-segment logic is covered against hand-written envelopes; a handful of
+integration tests synthesise a short WAV (tone / room tone / tone, with a clap
+in the quiet) and run it through real ffmpeg. Those skip automatically if
+ffmpeg and ffprobe aren't on PATH.
