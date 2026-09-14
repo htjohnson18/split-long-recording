@@ -173,6 +173,18 @@ def get_mean_volume(input_file, start, end):
     return None
 
 
+def nonnegative_float(value):
+    """Parse a float that must be >= 0. Negative padding would run segments
+    backwards past their own end, so reject it up front."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid number: {value!r}")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"Must be zero or greater, got {parsed:g}")
+    return parsed
+
+
 def parse_timestamp(ts):
     """Parse HH:MM:SS, MM:SS, or bare seconds into a float."""
     ts = ts.strip()
@@ -453,9 +465,9 @@ def main():
     parser.add_argument("--drop-short", action="store_true",
                         help="Drop segments shorter than --min-segment instead of merging them "
                              "into a neighbour (discards between-song banter and tuning)")
-    parser.add_argument("--pad-start", type=float, default=0.0,
+    parser.add_argument("--pad-start", type=nonnegative_float, default=0.0,
                         help="Seconds of lead-in to keep before each segment (default: 0)")
-    parser.add_argument("--pad-end", type=float, default=0.0,
+    parser.add_argument("--pad-end", type=nonnegative_float, default=0.0,
                         help="Seconds of tail to keep after each segment, for ring-outs "
                              "(default: 0)")
     parser.add_argument("--drop-quiet-db", type=float,
